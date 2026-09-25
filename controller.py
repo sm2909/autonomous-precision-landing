@@ -64,6 +64,11 @@ KZ = 1.5                            # altitude P  (-> velocity command)
 KVZ = 6.0                           # vertical velocity P (-> accel)
 VZ_MAX = 1.5
 
+# disturbance observer
+DOB_TAU = 0.08                    # low-pass time constant [s]
+DOB_MAX_XY = 2.5                  # max estimated disturbance accel [m/s^2]
+DOB_MAX_Z = 1.0                   # max estimated vertical disturbance accel [m/s^2]
+
 # descent profile  v_down(h) = min( V_TOUCH + K_DESC*h , V_DESC_MAX )
 V_TOUCH = 0.25
 K_DESC = 2.5
@@ -166,6 +171,18 @@ class FlightController:
         self.last_seen = -1e9
         self._prev_R = None
         self.omega_b = np.zeros(3)
+
+        # ---- disturbance observer ---------------------------------------
+        # Estimate external acceleration acting on the drone.
+        self._dob_prev_vel = None
+        self._dob_last_thrust = self.mass * self.gravity
+        self._dob_last_b3 = np.array([0.0, 0.0, 1.0])
+
+        self.disturbance_acc = np.zeros(3)
+
+        # First-order low-pass filter coefficient:
+        # alpha = dt / (tau + dt)
+        self._dob_alpha = self.dt / (DOB_TAU + self.dt)
 
         # ---- state machine ----------------------------------------------
         self.state = self.SEARCH
@@ -308,6 +325,60 @@ class FlightController:
             self.state = self.LANDED
             return 0.0, 0.0, 0.0, 0.0
 
+        # ── [DOB] external disturbance acceleration estimate ----------
+        #
+        # The simulator applies wind as an external WORLD-frame force.
+        # We estimate the resulting external acceleration by comparing:
+        #
+        #   measured acceleration
+        #   -
+        #   acceleration explained by our previous thrust command.
+        #
+        # The previous thrust / body-z direction correspond to the
+        # forces that produced the velocity change seen at this timestep.
+
+        if self._dob_prev_vel is None:
+            # First controller call: no valid finite-difference acceleration yet.
+            self._dob_prev_vel = vel.copy()
+
+        else:
+            # Measured world-frame acceleration.
+            a_meas = (vel - self._dob_prev_vel) / dt
+            self._dob_prev_vel = vel.copy()
+
+            # Acceleration explained by the thrust command that was
+            # actually sent during the previous simulation step.
+            a_model = (
+                (self._dob_last_thrust / self.mass) * self._dob_last_b3
+                + np.array([0.0, 0.0, -self.gravity])
+            )
+
+            # Residual = external disturbance acceleration + model error.
+            d_raw = a_meas - a_model
+
+            # Low-pass filter to reject numerical / finite-difference noise.
+            self.disturbance_acc += (
+                self._dob_alpha *
+                (d_raw - self.disturbance_acc)
+            )
+
+            # Safety bound on the observer.
+            self.disturbance_acc[0] = float(np.clip(
+                self.disturbance_acc[0],
+                -DOB_MAX_XY,
+                DOB_MAX_XY,
+            ))
+            self.disturbance_acc[1] = float(np.clip(
+                self.disturbance_acc[1],
+                -DOB_MAX_XY,
+                DOB_MAX_XY,
+            ))
+            self.disturbance_acc[2] = float(np.clip(
+                self.disturbance_acc[2],
+                -DOB_MAX_Z,
+                DOB_MAX_Z,
+            ))
+
         # ── [A] vision + [B] state estimation ─────────────────────────
         meas = self._vision(camera_frame, pos, R)
         lost_for = self.t - self.last_seen
@@ -372,7 +443,12 @@ class FlightController:
             p_ref, v_ref, a_ref = p_r, v_r, a_r
 
         kp, kd = WN_XY ** 2, 2 * ZETA_XY * WN_XY
-        a_xy = a_ref + kp * (p_ref - pos[:2]) + kd * (v_ref - vel[:2])
+        a_xy = (
+            a_ref
+            + kp * (p_ref - pos[:2])
+            + kd * (v_ref - vel[:2])
+            - self.disturbance_acc[:2]
+        )
 
         # ── vertical reference ────────────────────────────────────────
         if self.state in (self.DESCEND, self.BLIND_DESCEND):
@@ -385,7 +461,11 @@ class FlightController:
             z_ref = SEARCH_ALT if self.state == self.SEARCH else TRACK_ALT
             vz_des = float(np.clip(KZ * (z_ref - pos[2]), -VZ_MAX, VZ_MAX))
             az_ff = 0.0
-        a_z = az_ff + KVZ * (vz_des - vel[2])
+        a_z = (
+            az_ff
+            + KVZ * (vz_des - vel[2])
+            - self.disturbance_acc[2]
+        )
 
         # ── outer loop -> thrust vector -> desired attitude ───────────
         a_z = max(a_z, -0.8 * G)                       # never ask for free-fall
@@ -421,9 +501,19 @@ class FlightController:
             if (F_MAX - d.max()) > (-d.min()) else base
         f = np.clip(base + d, 0.0, F_MAX)
 
+        # Save the ACTUAL thrust that was applied this timestep.
+        # This is what the disturbance observer must use on the next call.
+        self._dob_last_thrust = float(np.sum(f))
+        self._dob_last_b3 = R[:, 2].copy()
+
         if self.debug and self.t - self._log_t > 0.5:
             self._log_t = self.t
-            print(f"[{self.t:5.2f}] {self.STATE_NAMES[self.state]:13s} "
-                  f"z={pos[2]:.2f} e={e_xy:.3f} ev={ev:.2f} vis={visible} "
-                  f"rp=({math.degrees(roll):.1f},{math.degrees(pitch):.1f})")
+            print(
+                f"[{self.t:5.2f}] {self.STATE_NAMES[self.state]:13s} "
+                f"z={pos[2]:.2f} e={e_xy:.3f} ev={ev:.2f} vis={visible} "
+                f"rp=({math.degrees(roll):.1f},{math.degrees(pitch):.1f}) "
+                f"dist=({self.disturbance_acc[0]:+.2f},"
+                f"{self.disturbance_acc[1]:+.2f},"
+                f"{self.disturbance_acc[2]:+.2f})"
+            )
         return float(f[0]), float(f[1]), float(f[2]), float(f[3])
