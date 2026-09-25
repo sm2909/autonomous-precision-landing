@@ -5,7 +5,6 @@ import time
 import math
 import numpy as np
 import cv2
-import os
 
 # This imports YOUR code from controller.py
 from controller import FlightController
@@ -62,44 +61,63 @@ def setup_environment():
     p.loadURDF("plane.urdf")
     p.resetDebugVisualizerCamera(cameraDistance=5, cameraYaw=45, cameraPitch=-30, cameraTargetPosition=[0, 0, 0])
 
-def _ensure_quad_obj(path="marker_quad.obj"):
-    """1x1 m flat quad in XY, normal +Z, UVs cover the FULL texture."""
-    if not os.path.exists(path):
-        with open(path, "w") as f:
-            f.write("o quad\nv -0.5 -0.5 0\nv 0.5 -0.5 0\nv 0.5 0.5 0\nv -0.5 0.5 0\n"
-                    "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvn 0 0 1\n"
-                    "f 1/1/1 2/2/1 3/3/1\nf 1/1/1 3/3/1 4/4/1\n")
-    return os.path.abspath(path)
-
 def spawn_rover():
-    # Base rover chassis (1m x 1m x 0.1m)
+    # Base rover chassis (1m x 1m x 0.1m) - Creates the mandatory white "quiet zone" margin
     base_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5, 0.5, 0.05], rgbaColor=[1, 1, 1, 1])
     base_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.5, 0.5, 0.05])
     
-    # Flat top marker plate (0.8m x 0.8m, flush on top surface to prevent texture stretching)
-    marker_vis = p.createVisualShape(p.GEOM_MESH, fileName=_ensure_quad_obj(), meshScale=[0.8, 0.8, 1.0], rgbaColor=[1,1,1,1])
-    marker_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.4, 0.4, 0.002])
+    # 1. Generate a mathematically perfect 7x7 ArUco binary matrix dynamically 
+    if hasattr(cv2.aruco, 'getPredefinedDictionary'):
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
+    else:
+        aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_5X5_100)
+        
+    marker_img = cv2.aruco.generateImageMarker(aruco_dict, 0, 7)
     
+    link_Masses, link_Col, link_Vis, link_Pos, link_Ori = [], [], [], [], []
+    link_Inertial_Pos, link_Inertial_Ori, link_Parent, link_JointTypes, link_JointAxis = [], [], [], [], []
+    
+    # 2. Build the marker using 49 solid colored PyBullet blocks (0.8m total width)
+    block_size = 0.8 / 7.0
+    half_b = block_size / 2.0
+    z_offset = 0.051  # Flush on top of the rover surface
+    
+    for row in range(7):
+        for col in range(7):
+            # Map 0 to dark gray/black, and 255 to white
+            color = [0.1, 0.1, 0.1, 1] if marker_img[row, col] == 0 else [1, 1, 1, 1]
+            vis_id = p.createVisualShape(p.GEOM_BOX, halfExtents=[half_b, half_b, 0.001], rgbaColor=color)
+            
+            x = -0.4 + half_b + (col * block_size)
+            y = 0.4 - half_b - (row * block_size)
+            
+            link_Masses.append(0.0)
+            link_Col.append(-1)
+            link_Vis.append(vis_id)
+            link_Pos.append([x, y, z_offset])
+            link_Ori.append([0, 0, 0, 1])
+            link_Inertial_Pos.append([0, 0, 0])
+            link_Inertial_Ori.append([0, 0, 0, 1])
+            link_Parent.append(0)
+            link_JointTypes.append(p.JOINT_FIXED)
+            link_JointAxis.append([0, 0, 1])
+            
     rover_id = p.createMultiBody(
         baseMass=10.0,
         baseCollisionShapeIndex=base_col,
         baseVisualShapeIndex=base_vis,
         basePosition=[0, 0, 0.05],
-        linkMasses=[0.01],
-        linkCollisionShapeIndices=[marker_col],
-        linkVisualShapeIndices=[marker_vis],
-        linkPositions=[[0, 0, 0.052]],
-        linkOrientations=[[0, 0, 0, 1]],
-        linkInertialFramePositions=[[0, 0, 0]],
-        linkInertialFrameOrientations=[[0, 0, 0, 1]],
-        linkParentIndices=[0],
-        linkJointTypes=[p.JOINT_FIXED],
-        linkJointAxis=[[0, 0, 1]]
+        linkMasses=link_Masses,
+        linkCollisionShapeIndices=link_Col,
+        linkVisualShapeIndices=link_Vis,
+        linkPositions=link_Pos,
+        linkOrientations=link_Ori,
+        linkInertialFramePositions=link_Inertial_Pos,
+        linkInertialFrameOrientations=link_Inertial_Ori,
+        linkParentIndices=link_Parent,
+        linkJointTypes=link_JointTypes,
+        linkJointAxis=link_JointAxis
     )
-    
-    # Apply ArUco texture cleanly onto the dedicated top plate link (link index 0)
-    tex_id = p.loadTexture("aruco_marker.png")
-    p.changeVisualShape(rover_id, 0, textureUniqueId=tex_id)
     return rover_id
 
 def spawn_quadcopter():
@@ -136,7 +154,7 @@ def get_drone_camera_image(drone_id, width=320, height=240, fov=60):
     up_vector = rot_matrix.dot(np.array([1, 0, 0])) 
     view_matrix = p.computeViewMatrix(camera_pos, camera_pos + camera_vector, up_vector)
     projection_matrix = p.computeProjectionMatrixFOV(fov, width / height, 0.1, 20.0)
-    _, _, rgb, _, _ = p.getCameraImage(width, height, view_matrix, projection_matrix, renderer=p.ER_BULLET_HARDWARE_OPENGL)
+    _, _, rgb, _, _ = p.getCameraImage(width, height, view_matrix, projection_matrix, renderer=p.ER_TINY_RENDERER)
     return cv2.cvtColor(np.reshape(rgb, (height, width, 4)).astype(np.uint8), cv2.COLOR_RGBA2BGR)
 
 def main():

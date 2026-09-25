@@ -1,0 +1,242 @@
+# local_arena_2.py (YOUR LOCAL TESTING ENVIRONMENT - DO NOT EDIT)
+import pybullet as p
+import pybullet_data
+import time
+import math
+import numpy as np
+import cv2
+import random
+
+# This imports YOUR code from controller.py
+from controller import FlightController
+
+class CompetitionScorer:
+    def __init__(self):
+        self.xy_errors = []
+        self.sim_time = 0.0
+        self.run_complete = False
+        
+        # You must design your landing logic to beat these thresholds!
+        self.MAX_SAFE_Z_VELOCITY = -0.65  # m/s
+        self.MAX_SAFE_TILT = 0.52         # radians (~30 degrees)
+        self.ROVER_SURFACE_Z = 0.15       # meters
+
+    def update(self, drone_pos, drone_vel, drone_ori, rover_pos, dt):
+        if self.run_complete:
+            return
+
+        self.sim_time += dt
+        error_dist = math.sqrt((drone_pos[0]-rover_pos[0])**2 + (drone_pos[1]-rover_pos[1])**2)
+        self.xy_errors.append(error_dist)
+
+        if drone_pos[2] < 0.08: 
+            self._trigger_failure("GROUND COLLISION: Missed the rover entirely.")
+            return
+
+        if drone_pos[2] <= self.ROVER_SURFACE_Z + 0.01 and error_dist < 0.5:
+            if drone_vel[2] < self.MAX_SAFE_Z_VELOCITY:
+                self._trigger_failure(f"CRASH: Descent velocity too high ({drone_vel[2]:.2f} m/s).")
+                return
+                
+            euler = p.getEulerFromQuaternion(drone_ori)
+            max_tilt = max(abs(euler[0]), abs(euler[1]))
+            if max_tilt > self.MAX_SAFE_TILT:
+                self._trigger_failure(f"CRASH: Excessive tilt ({math.degrees(max_tilt):.1f}°). Propeller strike.")
+                return
+                
+            if self.sim_time > 2.0 and abs(drone_vel[2]) < 0.05:
+                self._trigger_success(error_dist)
+
+    def _trigger_failure(self, reason):
+        print(f"\n[LOCAL TEST FAILED] {reason}")
+        self.run_complete = True
+
+    def _trigger_success(self, final_error):
+        print(f"\n[LOCAL TEST SUCCESS] Safe Touchdown Confirmed!")
+        self.run_complete = True
+
+def setup_environment():
+    p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.setGravity(0, 0, -9.81)
+    p.loadURDF("plane.urdf")
+    p.resetDebugVisualizerCamera(cameraDistance=5, cameraYaw=45, cameraPitch=-30, cameraTargetPosition=[0, 0, 0])
+
+def spawn_rover():
+    # Base rover chassis (1m x 1m x 0.1m) - Creates the mandatory white "quiet zone" margin
+    base_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5, 0.5, 0.05], rgbaColor=[1, 1, 1, 1])
+    base_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.5, 0.5, 0.05])
+    
+    # Generate a mathematically perfect 7x7 ArUco binary matrix dynamically 
+    if hasattr(cv2.aruco, 'getPredefinedDictionary'):
+        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
+    else:
+        aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_5X5_100)
+        
+    marker_img = cv2.aruco.generateImageMarker(aruco_dict, 0, 7)
+    
+    link_Masses, link_Col, link_Vis, link_Pos, link_Ori = [], [], [], [], []
+    link_Inertial_Pos, link_Inertial_Ori, link_Parent, link_JointTypes, link_JointAxis = [], [], [], [], []
+    
+    # Build the marker using 49 solid colored PyBullet blocks (0.8m total width)
+    block_size = 0.8 / 7.0
+    half_b = block_size / 2.0
+    z_offset = 0.051  # Flush on top of the rover surface
+    
+    for row in range(7):
+        for col in range(7):
+            # Map 0 to dark gray/black, and 255 to white
+            color = [0.1, 0.1, 0.1, 1] if marker_img[row, col] == 0 else [1, 1, 1, 1]
+            vis_id = p.createVisualShape(p.GEOM_BOX, halfExtents=[half_b, half_b, 0.001], rgbaColor=color)
+            
+            x = -0.4 + half_b + (col * block_size)
+            y = 0.4 - half_b - (row * block_size)
+            
+            link_Masses.append(0.0)
+            link_Col.append(-1)
+            link_Vis.append(vis_id)
+            link_Pos.append([x, y, z_offset])
+            link_Ori.append([0, 0, 0, 1])
+            link_Inertial_Pos.append([0, 0, 0])
+            link_Inertial_Ori.append([0, 0, 0, 1])
+            link_Parent.append(0)
+            link_JointTypes.append(p.JOINT_FIXED)
+            link_JointAxis.append([0, 0, 1])
+            
+    rover_id = p.createMultiBody(
+        baseMass=10.0,
+        baseCollisionShapeIndex=base_col,
+        baseVisualShapeIndex=base_vis,
+        basePosition=[0, 0, 0.05],
+        linkMasses=link_Masses,
+        linkCollisionShapeIndices=link_Col,
+        linkVisualShapeIndices=link_Vis,
+        linkPositions=link_Pos,
+        linkOrientations=link_Ori,
+        linkInertialFramePositions=link_Inertial_Pos,
+        linkInertialFrameOrientations=link_Inertial_Ori,
+        linkParentIndices=link_Parent,
+        linkJointTypes=link_JointTypes,
+        linkJointAxis=link_JointAxis
+    )
+    return rover_id
+
+def spawn_quadcopter():
+    chassis_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.1, 0.1, 0.04], rgbaColor=[0.15, 0.15, 0.15, 1])
+    chassis_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.1, 0.1, 0.04])
+    rotor_vis = p.createVisualShape(p.GEOM_CYLINDER, radius=0.12, length=0.01, rgbaColor=[0.4, 0.4, 0.4, 0.8])
+    rotor_col = p.createCollisionShape(p.GEOM_CYLINDER, radius=0.12, height=0.01)
+    
+    L = 0.25
+    H = 0.04 
+    drone_id = p.createMultiBody(
+        baseMass=1.0,
+        baseCollisionShapeIndex=chassis_col, 
+        baseVisualShapeIndex=chassis_vis, 
+        basePosition=[0, 0, 3.0],
+        linkMasses=[0.05]*4, 
+        linkCollisionShapeIndices=[rotor_col]*4, 
+        linkVisualShapeIndices=[rotor_vis]*4,
+        linkPositions=[[L, L, H], [-L, L, H], [L, -L, H], [-L, -L, H]], 
+        linkOrientations=[[0, 0, 0, 1]]*4,
+        linkInertialFramePositions=[[0, 0, 0]]*4, 
+        linkInertialFrameOrientations=[[0, 0, 0, 1]]*4,
+        linkParentIndices=[0, 0, 0, 0], 
+        linkJointTypes=[p.JOINT_FIXED]*4, 
+        linkJointAxis=[[0, 0, 1]]*4
+    )
+    return drone_id
+
+def get_drone_camera_image(drone_id, width=320, height=240, fov=60):
+    pos, ori = p.getBasePositionAndOrientation(drone_id)
+    rot_matrix = np.array(p.getMatrixFromQuaternion(ori)).reshape(3, 3)
+    camera_pos = np.array(pos) + rot_matrix.dot(np.array([0, 0, -0.1]))
+    camera_vector = rot_matrix.dot(np.array([0, 0, -1]))
+    up_vector = rot_matrix.dot(np.array([1, 0, 0])) 
+    view_matrix = p.computeViewMatrix(camera_pos, camera_pos + camera_vector, up_vector)
+    projection_matrix = p.computeProjectionMatrixFOV(fov, width / height, 0.1, 20.0)
+    _, _, rgb, _, _ = p.getCameraImage(width, height, view_matrix, projection_matrix, renderer=p.ER_BULLET_HARDWARE_OPENGL)
+    return cv2.cvtColor(np.reshape(rgb, (height, width, 4)).astype(np.uint8), cv2.COLOR_RGBA2BGR)
+
+def main():
+    setup_environment()
+    rover_id = spawn_rover()
+    drone_id = spawn_quadcopter()
+    
+    scorer = CompetitionScorer()
+    
+    # -----------------------------------------------------------------------
+    # THIS INITIALIZES YOUR CUSTOM CODE FROM controller.py
+    # -----------------------------------------------------------------------
+    my_drone_brain = FlightController()
+    
+    dt = 1.0 / 240.0
+    t = 0.0
+    
+    # Initialize wind tracking variables
+    current_wind = [0.0, 0.0, 0.0]
+    target_wind = [0.0, 0.0, 0.0]
+    
+    print("[SYSTEM] Simulation active. Testing local control logic...")
+    
+    while True:
+        if not p.isConnected():
+            print("[SYSTEM] Physics window closed by user. Exiting...")
+            break
+            
+        # Rover Kinematics
+        rover_vx = 1.2 * math.cos(t * 0.4) + 0.5 * math.cos(t * 1.1)
+        rover_vy = 1.2 * math.sin(t * 0.3) + 0.5 * math.sin(t * 0.9)
+        p.resetBaseVelocity(rover_id, linearVelocity=[rover_vx, rover_vy, 0])
+        
+        # Sensors
+        drone_pos, drone_ori = p.getBasePositionAndOrientation(drone_id)
+        drone_vel, _ = p.getBaseVelocity(drone_id)
+        rover_pos, _ = p.getBasePositionAndOrientation(rover_id)
+        camera_frame = get_drone_camera_image(drone_id)
+        
+        cv2.imshow("Drone Downward Camera", camera_frame)
+        cv2.waitKey(1)
+
+        # Scorer Update
+        scorer.update(drone_pos, drone_vel, drone_ori, rover_pos, dt)
+        if scorer.run_complete:
+            time.sleep(5)
+            break
+            
+        # --- DYNAMIC WIND GENERATION ---
+        # Pick a new random wind vector every 0.5 seconds (120 steps)
+        if int(t / dt) % 120 == 0:
+            target_wind = [
+                random.uniform(-2.0, 2.0),  # X-axis gust (Newtons)
+                random.uniform(-2.0, 2.0),  # Y-axis gust (Newtons)
+                random.uniform(-0.5, 0.5)   # Z-axis draft (Newtons)
+            ]
+
+        # Smoothly interpolate current wind to target to prevent physics engine spikes
+        current_wind[0] += (target_wind[0] - current_wind[0]) * 0.02
+        current_wind[1] += (target_wind[1] - current_wind[1]) * 0.02
+        current_wind[2] += (target_wind[2] - current_wind[2]) * 0.02
+
+        # Apply the wind force to the drone's center of mass (link -1) in the world frame
+        p.applyExternalForce(drone_id, -1, current_wind, [0, 0, 0], p.WORLD_FRAME)
+        # -------------------------------
+
+        # -----------------------------------------------------------------------
+        # THE ARENA ASKS YOUR CODE FOR THE MOTOR FORCES
+        # -----------------------------------------------------------------------
+        f1, f2, f3, f4 = my_drone_brain.calculate_forces(camera_frame, drone_pos, drone_ori, drone_vel)
+
+        # Apply Actuator Forces
+        L = 0.25
+        p.applyExternalForce(drone_id, -1, [0, 0, f1], [ L,  L, 0], p.LINK_FRAME)
+        p.applyExternalForce(drone_id, -1, [0, 0, f2], [-L,  L, 0], p.LINK_FRAME)
+        p.applyExternalForce(drone_id, -1, [0, 0, f3], [ L, -L, 0], p.LINK_FRAME)
+        p.applyExternalForce(drone_id, -1, [0, 0, f4], [-L, -L, 0], p.LINK_FRAME)
+        
+        p.stepSimulation()
+        time.sleep(dt)
+        t += dt
+
+if __name__ == '__main__':
+    main()
