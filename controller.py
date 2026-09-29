@@ -6,9 +6,22 @@ Pipeline (runs at 240 Hz, called by local_arena.py):
 
   camera frame ─► ArUco corners ─► ray-cast to marker plane (uses drone pose)
         ─► world-frame rover position ─► Kalman filter (pos, vel, acc)
-        ─► relative PD + acceleration feed-forward  (outer loop, world frame)
-        ─► desired thrust vector  ─► desired roll / pitch
-        ─► attitude PD (inner loop) ─► thrust mixer ─► 4 motor forces [N]
+        ─► outer loop: Position -> Velocity -> Acceleration cascade
+           (P position loop -> PI velocity loop, world frame, with
+           anti-windup) + acceleration feed-forward from the rover KF
+        ─► desired thrust vector  ─► desired roll / pitch  (hard tilt-limited)
+        ─► inner loop: Attitude -> Rate cascade
+           (P attitude loop -> PI rate loop, with anti-windup)
+        ─► thrust mixer ─► 4 motor forces [N]
+
+  Both cascades add an integral term on top of the original PD design so
+  that a *sustained* disturbance -- e.g. a constant-ish wind force/gust
+  acting on the airframe -- is driven to zero rather than left as a
+  standing offset that only proportional gain can (partially) fight.
+  Each integrator uses conditional-integration anti-windup: its state is
+  only updated on a step where the loop it feeds did *not* have to
+  saturate (tilt limit, free-fall floor, or motor/mixer limit), and is
+  additionally hard-clamped to a fixed range as a second line of defense.
 
 Conventions (verified against local_arena.py)
   * World: x,y horizontal, z up.  Body: x forward, y left, z up (thrust axis).
@@ -48,26 +61,44 @@ Z_CUT = 0.156              # cut motors when the base drops below this
 # ══════════════════════════════════════════════════════════════════════════
 #  Tunables
 # ══════════════════════════════════════════════════════════════════════════
-# outer loop (relative position / velocity of drone w.r.t. rover)
-WN_XY, ZETA_XY = 3.6, 1.0           # -> Kp = wn^2, Kd = 2 zeta wn
-A_MAX_XY = 3.5                      # horizontal accel limit [m/s^2]
-TILT_MAX = math.radians(25.0)       # tilt limit while flying
-TILT_MAX_LAND = math.radians(12.0)  # tilt limit near the ground
+# outer loop -- explicit Position -> Velocity -> Acceleration cascade
+# (relative position / velocity of drone w.r.t. rover, world frame XY)
+#
+# The P->V->A split is derived from the original single-stage PD
+# (kp = wn^2, kd = 2*zeta*wn) via the standard cascade identity
+#   kp_pos = wn / (2*zeta)      [pos error  -> velocity command]
+#   kp_vel = 2*zeta*wn          [vel error  -> accel command]
+# which reproduces the old PD exactly in the linear, unsaturated case,
+# while exposing a velocity-command stage that a PI (see KI_VEL_XY below)
+# can sit on top of for constant-wind rejection.
+WN_XY, ZETA_XY = 3.6, 1.0
+KP_POS_XY = WN_XY / (2.0 * ZETA_XY)     # position P  -> velocity command
+KP_VEL_XY = 2.0 * ZETA_XY * WN_XY       # velocity P  -> accel command
+KI_VEL_XY = 1.5                         # velocity I  -> accel command (wind bias)
+I_VEL_XY_MAX = 2.0                      # anti-windup clamp on the XY accel integral term [m/s^2]
+V_CMD_MAX_XY = 6.0                      # saturation on the commanded velocity [m/s]
+A_MAX_XY = 3.5                          # horizontal accel limit [m/s^2]
+TILT_MAX = math.radians(25.0)           # tilt limit while flying
+TILT_MAX_LAND = math.radians(12.0)      # tilt limit near the ground
 
-# inner loop (attitude)
+# inner loop -- explicit Attitude -> Rate cascade
+# Same cascade identity as above, using WN_ATT/ZETA_ATT as the reference
+# for the *combined* loop: kp_att = wn/(2*zeta), kp_rate = 2*zeta*wn.
 WN_ATT, ZETA_ATT = 26.0, 0.9
+KP_ATT = WN_ATT / (2.0 * ZETA_ATT)      # attitude angle P -> body-rate command
+RATE_MAX = 10.0                         # saturation on the commanded body rate [rad/s]
+KP_RATE = 2.0 * ZETA_ATT * WN_ATT       # rate P -> angular accel command
+KI_RATE = 25.0                          # rate I -> angular accel command (torque-bias / gust rejection)
+I_RATE_MAX = 40.0                       # anti-windup clamp on the rate integral's accel contribution [rad/s^2]
 
-# vertical
+# vertical -- Position(altitude) -> Velocity -> Acceleration cascade
 TRACK_ALT = 3.0
 SEARCH_ALT = 4.5
 KZ = 1.5                            # altitude P  (-> velocity command)
 KVZ = 6.0                           # vertical velocity P (-> accel)
+KIZ = 1.0                           # vertical velocity I (-> accel, rejects steady vertical draft)
+I_Z_MAX = 1.0                       # anti-windup clamp on the Z accel integral term [m/s^2]
 VZ_MAX = 1.5
-
-# disturbance observer
-DOB_TAU = 0.08                    # low-pass time constant [s]
-DOB_MAX_XY = 2.5                  # max estimated disturbance accel [m/s^2]
-DOB_MAX_Z = 1.0                   # max estimated vertical disturbance accel [m/s^2]
 
 # descent profile  v_down(h) = min( V_TOUCH + K_DESC*h , V_DESC_MAX )
 V_TOUCH = 0.25
@@ -172,23 +203,23 @@ class FlightController:
         self._prev_R = None
         self.omega_b = np.zeros(3)
 
-        # ---- disturbance observer ---------------------------------------
-        # Estimate external acceleration acting on the drone.
-        self._dob_prev_vel = None
-        self._dob_last_thrust = self.mass * self.gravity
-        self._dob_last_b3 = np.array([0.0, 0.0, 1.0])
-
-        self.disturbance_acc = np.zeros(3)
-
-        # First-order low-pass filter coefficient:
-        # alpha = dt / (tau + dt)
-        self._dob_alpha = self.dt / (DOB_TAU + self.dt)
-
         # ---- state machine ----------------------------------------------
         self.state = self.SEARCH
         self._sync_timer = 0.0
         self._anchor = None          # spiral-search centre
         self._spiral_theta = 0.0
+
+        # ---- integral (wind-rejection) states, with anti-windup --------
+        # Each is only *committed* when the loop it feeds is not saturated
+        # this step (conditional-integration anti-windup), and is additionally
+        # hard-clamped to the *_MAX constants above as a second line of
+        # defense. This keeps a sustained wind bias (e.g. a steady gust)
+        # from being fought only by proportional gain (which needs a
+        # persistent error to produce persistent force) or from winding
+        # up unboundedly while a loop is saturated.
+        self.vel_int_xy = np.zeros(2)   # velocity-loop integral -> XY accel [m/s^2]
+        self.vel_int_z = 0.0            # vertical velocity-loop integral -> Z accel [m/s^2]
+        self.rate_int = np.zeros(2)     # rate-loop integral -> (roll, pitch) angular accel [rad/s^2]
 
         self._log_t = 0.0
 
@@ -325,60 +356,6 @@ class FlightController:
             self.state = self.LANDED
             return 0.0, 0.0, 0.0, 0.0
 
-        # ── [DOB] external disturbance acceleration estimate ----------
-        #
-        # The simulator applies wind as an external WORLD-frame force.
-        # We estimate the resulting external acceleration by comparing:
-        #
-        #   measured acceleration
-        #   -
-        #   acceleration explained by our previous thrust command.
-        #
-        # The previous thrust / body-z direction correspond to the
-        # forces that produced the velocity change seen at this timestep.
-
-        if self._dob_prev_vel is None:
-            # First controller call: no valid finite-difference acceleration yet.
-            self._dob_prev_vel = vel.copy()
-
-        else:
-            # Measured world-frame acceleration.
-            a_meas = (vel - self._dob_prev_vel) / dt
-            self._dob_prev_vel = vel.copy()
-
-            # Acceleration explained by the thrust command that was
-            # actually sent during the previous simulation step.
-            a_model = (
-                (self._dob_last_thrust / self.mass) * self._dob_last_b3
-                + np.array([0.0, 0.0, -self.gravity])
-            )
-
-            # Residual = external disturbance acceleration + model error.
-            d_raw = a_meas - a_model
-
-            # Low-pass filter to reject numerical / finite-difference noise.
-            self.disturbance_acc += (
-                self._dob_alpha *
-                (d_raw - self.disturbance_acc)
-            )
-
-            # Safety bound on the observer.
-            self.disturbance_acc[0] = float(np.clip(
-                self.disturbance_acc[0],
-                -DOB_MAX_XY,
-                DOB_MAX_XY,
-            ))
-            self.disturbance_acc[1] = float(np.clip(
-                self.disturbance_acc[1],
-                -DOB_MAX_XY,
-                DOB_MAX_XY,
-            ))
-            self.disturbance_acc[2] = float(np.clip(
-                self.disturbance_acc[2],
-                -DOB_MAX_Z,
-                DOB_MAX_Z,
-            ))
-
         # ── [A] vision + [B] state estimation ─────────────────────────
         meas = self._vision(camera_frame, pos, R)
         lost_for = self.t - self.last_seen
@@ -442,15 +419,21 @@ class FlightController:
         else:
             p_ref, v_ref, a_ref = p_r, v_r, a_r
 
-        kp, kd = WN_XY ** 2, 2 * ZETA_XY * WN_XY
-        a_xy = (
-            a_ref
-            + kp * (p_ref - pos[:2])
-            + kd * (v_ref - vel[:2])
-            - self.disturbance_acc[:2]
-        )
+        # [P] horizontal position error -> velocity command (saturated)
+        v_cmd_xy = v_ref + KP_POS_XY * (p_ref - pos[:2])
+        v_cmd_n = np.linalg.norm(v_cmd_xy)
+        if v_cmd_n > V_CMD_MAX_XY:
+            v_cmd_xy = v_cmd_xy * (V_CMD_MAX_XY / v_cmd_n)
 
-        # ── vertical reference ────────────────────────────────────────
+        # [V]->[A] horizontal velocity error -> acceleration command (PI).
+        # The integral update is only a *trial* until we know downstream
+        # (tilt/accel limit) didn't have to clip it -- see anti-windup below.
+        ev_xy = v_cmd_xy - vel[:2]
+        i_xy_cap = I_VEL_XY_MAX / max(KI_VEL_XY, 1e-9)
+        vel_int_xy_trial = np.clip(self.vel_int_xy + ev_xy * dt, -i_xy_cap, i_xy_cap)
+        a_xy = a_ref + KP_VEL_XY * ev_xy + KI_VEL_XY * vel_int_xy_trial
+
+        # ── vertical reference: Position(alt) -> Velocity -> Acceleration ─
         if self.state in (self.DESCEND, self.BLIND_DESCEND):
             vz_des, az_ff = self._descent_profile(pos[2])
             # fade descent speed if the XY error is too large (landing cone)
@@ -461,19 +444,30 @@ class FlightController:
             z_ref = SEARCH_ALT if self.state == self.SEARCH else TRACK_ALT
             vz_des = float(np.clip(KZ * (z_ref - pos[2]), -VZ_MAX, VZ_MAX))
             az_ff = 0.0
-        a_z = (
-            az_ff
-            + KVZ * (vz_des - vel[2])
-            - self.disturbance_acc[2]
-        )
+
+        ev_z = vz_des - vel[2]
+        i_z_cap = I_Z_MAX / max(KIZ, 1e-9)
+        vel_int_z_trial = float(np.clip(self.vel_int_z + ev_z * dt, -i_z_cap, i_z_cap))
+        a_z = az_ff + KVZ * ev_z + KIZ * vel_int_z_trial
 
         # ── outer loop -> thrust vector -> desired attitude ───────────
+        a_z_floor_hit = a_z < -0.8 * G
         a_z = max(a_z, -0.8 * G)                       # never ask for free-fall
+        # anti-windup: commit the Z integral only if the free-fall floor
+        # didn't have to clip this step's output (conditional integration)
+        if not a_z_floor_hit:
+            self.vel_int_z = vel_int_z_trial
+
         tilt_max = TILT_MAX_LAND if pos[2] < 0.8 else TILT_MAX
         a_h_max = min(A_MAX_XY, (G + a_z) * math.tan(tilt_max))
         n = np.linalg.norm(a_xy)
-        if n > a_h_max:
+        xy_saturated = n > a_h_max
+        if xy_saturated:
             a_xy = a_xy * (a_h_max / n)
+        # anti-windup: commit the XY integral only if the tilt/accel limit
+        # didn't have to clip this step's output (conditional integration)
+        if not xy_saturated:
+            self.vel_int_xy = vel_int_xy_trial
 
         a_vec = np.array([a_xy[0], a_xy[1], G + a_z])
         b3 = R[:, 2]
@@ -485,11 +479,27 @@ class FlightController:
         ay_h = -sy * a_vec[0] + cy * a_vec[1]
         pitch_des = math.atan2(ax_h, a_vec[2])
         roll_des = math.atan2(-ay_h, math.hypot(ax_h, a_vec[2]))
+        # hard direct tilt clamp -- a second line of defense on top of the
+        # accel-based limit above (which assumes thrust stays close to
+        # mass*g; under integral action / gusts this keeps attitude honest)
+        roll_des = float(np.clip(roll_des, -tilt_max, tilt_max))
+        pitch_des = float(np.clip(pitch_des, -tilt_max, tilt_max))
 
-        # ── inner loop: attitude PD  (torque = I * desired ang. accel) ──
-        wn, z = WN_ATT, ZETA_ATT
-        alpha_x = wn * wn * (roll_des - roll) - 2 * z * wn * self.omega_b[0]
-        alpha_y = wn * wn * (pitch_des - pitch) - 2 * z * wn * self.omega_b[1]
+        # ── inner loop: Attitude -> Rate cascade  (torque = I * ang. accel) ─
+        # [P] attitude angle error -> body-rate command (saturated)
+        rate_cmd_x = float(np.clip(KP_ATT * (roll_des - roll), -RATE_MAX, RATE_MAX))
+        rate_cmd_y = float(np.clip(KP_ATT * (pitch_des - pitch), -RATE_MAX, RATE_MAX))
+
+        # [PI] body-rate error -> angular acceleration command. As above,
+        # the integral update is a trial until we know the mixer/motor
+        # limits below didn't have to clip the resulting torque.
+        er_x = rate_cmd_x - self.omega_b[0]
+        er_y = rate_cmd_y - self.omega_b[1]
+        i_rate_cap = I_RATE_MAX / max(KI_RATE, 1e-9)
+        rate_int_trial = np.clip(self.rate_int + np.array([er_x, er_y]) * dt,
+                                  -i_rate_cap, i_rate_cap)
+        alpha_x = KP_RATE * er_x + KI_RATE * rate_int_trial[0]
+        alpha_y = KP_RATE * er_y + KI_RATE * rate_int_trial[1]
         tau_x, tau_y = IXX * alpha_x, IXX * alpha_y
 
         # ── mixer (yaw torque is not producible in this arena) ────────
@@ -499,21 +509,18 @@ class FlightController:
         base = T / 4.0
         base = float(np.clip(base, -d.min(), F_MAX - d.max())) \
             if (F_MAX - d.max()) > (-d.min()) else base
-        f = np.clip(base + d, 0.0, F_MAX)
-
-        # Save the ACTUAL thrust that was applied this timestep.
-        # This is what the disturbance observer must use on the next call.
-        self._dob_last_thrust = float(np.sum(f))
-        self._dob_last_b3 = R[:, 2].copy()
+        f_unclamped = base + d
+        f = np.clip(f_unclamped, 0.0, F_MAX)
+        # anti-windup: commit the rate-loop integral only if no motor had to
+        # be clamped this step (conditional integration) -- otherwise the
+        # torque demand didn't actually reach the airframe and integrating
+        # further would just wind the integrator up against the saturation.
+        if np.allclose(f, f_unclamped):
+            self.rate_int = rate_int_trial
 
         if self.debug and self.t - self._log_t > 0.5:
             self._log_t = self.t
-            print(
-                f"[{self.t:5.2f}] {self.STATE_NAMES[self.state]:13s} "
-                f"z={pos[2]:.2f} e={e_xy:.3f} ev={ev:.2f} vis={visible} "
-                f"rp=({math.degrees(roll):.1f},{math.degrees(pitch):.1f}) "
-                f"dist=({self.disturbance_acc[0]:+.2f},"
-                f"{self.disturbance_acc[1]:+.2f},"
-                f"{self.disturbance_acc[2]:+.2f})"
-            )
+            print(f"[{self.t:5.2f}] {self.STATE_NAMES[self.state]:13s} "
+                  f"z={pos[2]:.2f} e={e_xy:.3f} ev={ev:.2f} vis={visible} "
+                  f"rp=({math.degrees(roll):.1f},{math.degrees(pitch):.1f})")
         return float(f[0]), float(f[1]), float(f[2]), float(f[3])

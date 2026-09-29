@@ -219,7 +219,8 @@ def main():
         current_wind[2] += (target_wind[2] - current_wind[2]) * 0.02
 
         # Apply the wind force to the drone's center of mass (link -1) in the world frame
-        p.applyExternalForce(drone_id, -1, current_wind, [0, 0, 0], p.WORLD_FRAME)
+        # p.applyExternalForce(drone_id, -1, current_wind, [0, 0, 0], p.WORLD_FRAME)
+        p.applyExternalForce(drone_id, -1, current_wind, [0, 0, 0], p.LINK_FRAME)
         # -------------------------------
 
         # -----------------------------------------------------------------------
