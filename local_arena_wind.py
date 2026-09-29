@@ -1,4 +1,4 @@
-# local_arena_2.py (YOUR LOCAL TESTING ENVIRONMENT - DO NOT EDIT)
+# local_arena_wind.py (YOUR LOCAL TESTING ENVIRONMENT - DO NOT EDIT)
 import pybullet as p
 import pybullet_data
 import time

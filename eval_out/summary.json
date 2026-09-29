@@ -1,0 +1,104 @@
+{
+  "summary": {
+    "nominal": {
+      "n": 20,
+      "success": 19,
+      "rate": 0.95,
+      "ci_lo": 0.7638641064874331,
+      "ci_hi": 0.9911187805671268,
+      "fail_reasons": [
+        "GROUND COLLISION: Missed the rover entirely."
+      ],
+      "vz_mean": -0.27952388039994575,
+      "vz_worst": -0.6000205498167482,
+      "tilt_mean": 5.7526604062158775,
+      "tilt_worst": 17.67757311583271,
+      "err_mean": 16.65749005076253,
+      "err_worst": 77.58913523829186,
+      "err_final_mean": 18.53783286244298,
+      "t_acq_mean": 0.26375000000000026,
+      "t_acq_worst": 0.3125000000000001,
+      "t_end_mean": 5.275877192982477,
+      "t_end_worst": 6.724999999999938,
+      "blind_frac": 1.0,
+      "peak_down_worst": 1.5527289243806233
+    },
+    "far_start": {
+      "n": 6,
+      "success": 5,
+      "rate": 0.8333333333333334,
+      "ci_lo": 0.43649056343635395,
+      "ci_hi": 0.9699474141282697,
+      "fail_reasons": [
+        ""
+      ],
+      "vz_mean": -0.2464660569579085,
+      "vz_worst": -0.37489096598320476,
+      "tilt_mean": 3.616958240561696,
+      "tilt_worst": 7.408530355001028,
+      "err_mean": 81.25129986535485,
+      "err_worst": 420.4416900194211,
+      "err_final_mean": 82.45389449605823,
+      "t_acq_mean": 21.336805555556975,
+      "t_acq_worst": 41.44583333333935,
+      "t_end_mean": 23.888333333335353,
+      "t_end_worst": 45.012500000008856,
+      "blind_frac": 0.8333333333333334,
+      "peak_down_worst": 1.5566764911085245
+    },
+    "dropout_track": {
+      "n": 6,
+      "success": 5,
+      "rate": 0.8333333333333334,
+      "ci_lo": 0.43649056343635395,
+      "ci_hi": 0.9699474141282697,
+      "fail_reasons": [
+        "GROUND COLLISION: Missed the rover entirely."
+      ],
+      "vz_mean": -0.3535444136344325,
+      "vz_worst": -0.6269065345737226,
+      "tilt_mean": 6.628778712029885,
+      "tilt_worst": 17.909886848163467,
+      "err_mean": 22.383797952633742,
+      "err_worst": 76.41753206288084,
+      "err_final_mean": 23.318539261984792,
+      "t_acq_mean": 0.26944444444444476,
+      "t_acq_worst": 0.32500000000000007,
+      "t_end_mean": 7.225833333333243,
+      "t_end_worst": 8.312499999999849,
+      "blind_frac": 1.0,
+      "peak_down_worst": 1.5427644175656685
+    },
+    "blackout_low": {
+      "n": 6,
+      "success": 5,
+      "rate": 0.8333333333333334,
+      "ci_lo": 0.43649056343635395,
+      "ci_hi": 0.9699474141282697,
+      "fail_reasons": [
+        "GROUND COLLISION: Missed the rover entirely."
+      ],
+      "vz_mean": -0.46929759367915397,
+      "vz_worst": -1.2326621238812563,
+      "tilt_mean": 6.300941636527564,
+      "tilt_worst": 8.919789628760004,
+      "err_mean": 29.411357137965968,
+      "err_worst": 128.22958732129158,
+      "err_final_mean": 30.75979889028115,
+      "t_acq_mean": 0.26944444444444476,
+      "t_acq_worst": 0.32500000000000007,
+      "t_end_mean": 5.220000000000024,
+      "t_end_worst": 7.120833333333249,
+      "blind_frac": 1.0,
+      "peak_down_worst": 1.5461498036818255
+    }
+  },
+  "versions": {
+    "python": "3.14.7",
+    "numpy": "2.5.3",
+    "opencv": "5.0.0",
+    "aruco": "cv2.aruco OK",
+    "pybullet": "installed (pybullet.getAPIVersion=202010061)",
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O"
+  }
+}
