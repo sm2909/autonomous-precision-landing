@@ -12,11 +12,6 @@ A single-file, vision-based flight controller (`controller.py`) that finds a mov
 | `eval_landing.py` | Auxiliary batch evaluator used for the report. It does not modify the controller or the arena. |
 | `README.md` | This file. |
 | `Landing_Controller_Report_Final.pdf` | Technical report (maths, block diagrams, vision pipeline, state machine, tuning, edge cases, validation). |
-| Demo video | Link below. |
-
-## Demo video
-
-> **[PASTE DEMO VIDEO LINK HERE]**
 
 ## Dependencies
 
